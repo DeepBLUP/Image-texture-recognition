@@ -1,0 +1,309 @@
+import os
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, models
+from torch.utils.data import DataLoader, Dataset, random_split
+from PIL import Image
+from sklearn.metrics import mean_squared_error, r2_score
+from tqdm import tqdm
+import numpy as np
+from scipy.stats import pearsonr
+from sklearn.preprocessing import MinMaxScaler
+
+# 设置随机种子
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# 自定义Dataset类
+class PorkFatDataset(Dataset):
+    def __init__(self, img_dir, labels_file, transform=None, scaler=None):
+        self.img_dir = img_dir
+        self.labels = pd.read_csv(labels_file)
+        self.transform = transform
+        self.scaler = scaler
+
+        if self.scaler:
+            self.labels.iloc[:, 1] = self.scaler.transform(self.labels.iloc[:, 1].values.reshape(-1, 1))
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img_name = self.labels.iloc[idx, 0]
+        img_path_jpg = os.path.join(self.img_dir, f"{img_name}.jpg")
+        img_path_png = os.path.join(self.img_dir, f"{img_name}.png")
+
+        if os.path.exists(img_path_jpg):
+            img_path = img_path_jpg
+        elif os.path.exists(img_path_png):
+            img_path = img_path_png
+        else:
+            print(f"File not found: {img_path_jpg} or {img_path_png}")
+            return None
+
+        image = Image.open(img_path).convert("RGB")
+        label = self.labels.iloc[idx, 1]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(label, dtype=torch.float32)
+
+# 数据预处理
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# 数据集路径
+img_dir = '/home/chuannong1/ZLY/2024/IMF/datasets/test1'
+labels_file = '/home/chuannong1/ZLY/2024/IMF/大理石纹等级/labels906.csv'
+
+# 评估模型函数
+def evaluate_model(model, loader, criterion, device):
+    model.eval()
+    val_loss = 0.0
+    labels_list = []
+    preds_list = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device).float().view(-1, 1)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item() * images.size(0)
+            labels_list.extend(labels.cpu().numpy())
+            preds_list.extend(outputs.cpu().numpy())
+
+    val_loss /= len(loader.dataset)
+    val_rmse = mean_squared_error(labels_list, preds_list, squared=False)
+    val_r2 = r2_score(labels_list, preds_list)
+    val_pcc, _ = pearsonr(np.squeeze(labels_list), np.squeeze(preds_list))
+    return val_loss, val_rmse, val_r2, val_pcc
+
+# 自定义ResNet50模型
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+class SEBottleneck(models.resnet.Bottleneck):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None, reduction=16):
+        super(SEBottleneck, self).__init__(
+            inplanes, planes, stride, downsample, groups, base_width, dilation, norm_layer)
+        self.se = SELayer(planes * self.expansion, reduction)
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+        
+        out = self.se(out)  # 应用SE模块
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+class ModifiedResNet50(models.ResNet):
+    def __init__(self, block, layers, num_classes=1, zero_init_residual=False):
+        super(ModifiedResNet50, self).__init__(block, layers, num_classes)
+        self.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(self.fc.in_features, num_classes)
+        )
+
+    def _forward_impl(self, x):
+        # 使用原始ResNet50的前向传播方法
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+
+        return x
+
+def main():
+    # 设置设备
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 对目标值进行归一化处理（不需要）
+    #scaler = MinMaxScaler()
+    labels = pd.read_csv(labels_file)
+    #labels.iloc[:, 1] = scaler.fit_transform(labels.iloc[:, 1].values.reshape(-1, 1))
+    #labels.to_csv(labels_file, index=False)
+
+    # 加载数据集
+    dataset = PorkFatDataset(img_dir=img_dir, labels_file=labels_file, transform=train_transform)
+
+    # 划分训练集、验证集和测试集
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.2 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
+
+    # 使用ResNet50模型
+    model = ModifiedResNet50(SEBottleneck, [3, 4, 6, 3])
+    model.load_state_dict(models.resnet50(pretrained=True).state_dict(), strict=False)
+    model = model.to(device)
+
+    # 损失函数和优化器
+    criterion = nn.HuberLoss(delta=1.0)
+    optimizer = optim.Adam(model.parameters(), lr=0.00001)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
+
+    # 训练模型
+    num_epochs = 200
+    best_val_pcc = -float('inf')
+    best_val_r2 = -float('inf')
+
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        train_labels = []
+        train_preds = []
+
+        train_loader_tqdm = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", ncols=100)
+
+        for images, labels in train_loader_tqdm:
+            images = images.to(device)
+            labels = labels.to(device).float().view(-1, 1)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * images.size(0)
+            train_labels.extend(labels.cpu().numpy())
+            train_preds.extend(outputs.cpu().detach().numpy())
+
+            train_loader_tqdm.set_postfix({"Loss": loss.item()})
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_rmse = mean_squared_error(train_labels, train_preds, squared=False)
+        epoch_r2 = r2_score(train_labels, train_preds)
+        epoch_pcc, _ = pearsonr(np.squeeze(train_labels), np.squeeze(train_preds))
+        print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}, RMSE: {epoch_rmse:.4f}, R²: {epoch_r2:.4f}, PCC: {epoch_pcc:.4f}')
+
+        # 验证模型
+        val_loss, val_rmse, val_r2, val_pcc = evaluate_model(model, val_loader, criterion, device)
+        print(f'Validation Loss: {val_loss:.4f}, RMSE: {val_rmse:.4f}, R²: {val_r2:.4f}, PCC: {val_pcc:.4f}')
+
+        # 保存最好的模型
+        if val_pcc > best_val_pcc:
+            best_val_pcc = val_pcc
+            torch.save(model.state_dict(), '/home/chuannong1/ZLY/2024/IMF/大理石纹等级/ResNet/best_model906-SE.pth')
+
+        scheduler.step()
+
+    print('Training complete')
+
+    # 测试模型
+    model.load_state_dict(torch.load('/home/chuannong1/ZLY/2024/IMF/大理石纹等级/ResNet/best_model906-SE.pth'))
+    model.eval()
+    test_loss = 0.0
+    test_labels = []
+    test_preds = []
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device).float().view(-1, 1)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            test_loss += loss.item() * images.size(0)
+            test_labels.extend(labels.cpu().numpy())
+            test_preds.extend(outputs.cpu().numpy())
+
+    test_loss /= len(test_loader.dataset)
+    test_rmse = mean_squared_error(test_labels, test_preds, squared=False)
+    test_r2 = r2_score(test_labels, test_preds)
+    test_pcc, _ = pearsonr(np.squeeze(test_labels), np.squeeze(test_preds))
+    print(f'Test Loss: {test_loss:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}, PCC: {test_pcc:.4f}')
+    residuals = np.array(test_preds) - np.array(test_labels)
+    count_below_threshold = np.sum(np.abs(residuals) < 0.005)
+    proportion_below_threshold = count_below_threshold / len(residuals)
+    print(f'Proportion of residuals below 0.005: {proportion_below_threshold:.2%}')
+
+    data = {
+        'Test Loss': [test_loss],
+        'RMSE': [test_rmse],
+        'R²': [test_r2],
+        'PCC': [test_pcc],
+        'Proportion of residuals < 0.005': [proportion_below_threshold]
+    }
+
+    df = pd.DataFrame(data)
+
+    # 保存DataFrame到CSV文件
+    df.to_csv('/home/chuannong1/ZLY/2024/IMF/大理石纹等级/ResNet/test_metrics906SE.csv', index=False)
+    print("Metrics saved to 'test_metrics.csv'.")
+
+
+
+if __name__ == '__main__':
+    main()
